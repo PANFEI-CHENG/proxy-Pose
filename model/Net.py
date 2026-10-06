@@ -58,7 +58,7 @@ class Net(nn.Module):
         if self.cfg.rgb_backbone == 'resnet':
             rgb_local = self.rgb_extractor(rgb) 
         elif self.cfg.rgb_backbone == 'dino':
-            dino_feature = self.rgb_extractor .forward_features(rgb)["x_prenorm"][:, 1:]  
+            dino_feature = self.rgb_extractor.forward_features(rgb)["x_prenorm"][:, 1:]  
             f_dim = dino_feature.shape[-1]
             num_patches =int(dino_feature.shape[1]**0.5)
             dino_feature = dino_feature.reshape(b, num_patches, num_patches, f_dim).permute(0,3,1,2)
@@ -80,6 +80,7 @@ class Net(nn.Module):
 
         pts_local = self.pts_extractor(pts) # b, c, n
 
+        q, coarse_point_cloud, denoise_length = self.base_model(pts, rgb_local)  # B M C 3 and B M 3
 
         batch_kpt_query, heat_map = self.IAKD(rgb_local, pts_local)
         kpt_3d = torch.bmm(heat_map, pts)

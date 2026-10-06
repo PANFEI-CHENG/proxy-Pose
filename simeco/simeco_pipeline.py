@@ -1132,7 +1132,7 @@ class PCTransformer(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    def forward(self, xyz):
+    def forward(self, xyz, rgb_local=None):
         # Extract features using graph-based encoder
         coor, f = self.grouper(xyz, self.center_num)
         
