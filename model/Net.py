@@ -99,8 +99,8 @@ class Net(nn.Module):
 
         recon_model, recon_delta = self.reconstructor(obj_q, obj_3d)
 
-        kpt_nocs = self.nocs_predictor(obj_inv, index)
-        r, t, s = self.estimator(obj_3d, kpt_nocs.detach(), obj_inv)
+        kpt_nocs = self.nocs_predictor(q_inv, index)
+        r, t, s = self.estimator(obj_3d, kpt_nocs[:, :num_obj].detach(), obj_inv)
 
         if self.training:
             end_points['recon_delta'] = recon_delta
