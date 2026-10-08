@@ -1,6 +1,6 @@
 name: SIMECO
-num_query: 96 
-skeleton_num: 72
+num_query: 64 
+skeleton_num: 48
 num_points: 16384
 center_num: [512, 256]
 global_feature_dim: 1024

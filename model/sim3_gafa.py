@@ -178,14 +178,15 @@ class Sim3CrossGAFABlock(nn.Module):
 
 class Sim3GeometricAwareFeatureAggregator(nn.Module):
     """Object-GAFA1 / Proxy-GAFA1 -> bidirectional cross -> Object/Proxy-GAFA2."""
-    def __init__(self, cfg, query_dim, context_dim, bias_epsilon=1e-6):
+    def __init__(self, cfg, query_dim, context_dim, num_object_queries,
+                 num_proxy_queries, bias_epsilon=1e-6):
         super().__init__()
         dim = cfg.d_model
         ks = list(cfg.K)
         if len(ks) != 2:
             raise ValueError(f"Expected cfg.GAFA.K to contain two k values, got {ks}")
-        self.num_object_queries = int(getattr(cfg, 'num_object_queries', 96))
-        self.num_proxy_queries = int(getattr(cfg, 'num_proxy_queries', 72))
+        self.num_object_queries = int(num_object_queries)
+        self.num_proxy_queries = int(num_proxy_queries)
         cross_k = int(getattr(cfg, 'cross_k', 8))
         self.query_proj = VecLinear(query_dim, dim, mode="sim3", bias_epsilon=bias_epsilon)
         self.context_proj = VecLinear(context_dim, dim, mode="sim3", bias_epsilon=bias_epsilon)

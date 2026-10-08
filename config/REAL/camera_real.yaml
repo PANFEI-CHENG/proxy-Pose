@@ -34,10 +34,8 @@ pose_net:
       num_head: 4
   GAFA:
     block_num: 2
-    K: [16, 32]
+    K: [16, 24]
     d_model: 256
-    num_object_queries: 96
-    num_proxy_queries: 72
     cross_k: 8
   NOCS_Predictor:
     cat_num: 6
@@ -48,7 +46,7 @@ pose_net:
       dim_ffn: 256
       num_head: 4
   Reconstructor:
-    pts_per_kpt: 10
+    pts_per_kpt: 16
     ndim: 256
   
 optimizer:

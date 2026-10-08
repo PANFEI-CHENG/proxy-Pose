@@ -36,6 +36,8 @@ class Net(nn.Module):
             cfg.GAFA,
             query_dim=simeco_cfg.decoder_config.embed_dim,
             context_dim=simeco_cfg.decoder_config.embed_dim,
+            num_object_queries=simeco_cfg.num_query,
+            num_proxy_queries=simeco_cfg.skeleton_num,
             bias_epsilon=simeco_cfg.bias_epsilon,
         )
 
