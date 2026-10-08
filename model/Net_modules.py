@@ -4,6 +4,8 @@ import torch.nn.functional as F
 
 from rotation_utils import Ortho6d2Mat
 
+from simeco.vec_layers import VecLinear
+
 def index_points(points, idx):
     """
     Input:
@@ -518,3 +520,185 @@ class PoseSizeEstimator(nn.Module):
         t = self.translation_estimator(pose_feat)
         s = self.size_estimator(pose_feat)
         return r,t,s
+
+
+class EquivariantPoseInitializer(nn.Module):
+    def __init__(self, channels=256, min_scale=1e-5):
+        super().__init__()
+        self.channels = channels
+        self.min_scale = min_scale
+
+        # Four equivariant vectors: x-axis, y-axis, scale, translation offset
+        self.vec_head = VecLinear(2 * channels, 4, mode="so3", bias_epsilon=0.0)
+
+    @staticmethod
+    def _orthogonalize(x, y):
+        ex = F.normalize(x, dim=-1, eps=1e-7)
+        ey = y - (ex * y).sum(dim=-1, keepdim=True) * ex
+        ey = F.normalize(ey, dim=-1, eps=1e-7)
+        ez = torch.cross(ex, ey, dim=-1)
+        return torch.stack([ex, ey, ez], dim=-1)
+
+    def forward(self, q, xyz, num_obj):
+        b, n, c, d = q.shape
+        if d != 3 or c != self.channels or xyz.shape != (b, n, 3):
+            raise ValueError(f"Unexpected shape: q={tuple(q.shape)}, xyz={tuple(xyz.shape)}")
+        if not 0 < num_obj < n:
+            raise ValueError("num_obj must leave at least one Proxy Query")
+
+        # Remove translation while preserving rotation and scale equivariance
+        v = q - q.mean(dim=2, keepdim=True)
+
+        # Aggregate Object and Proxy equivariant features
+        obj_pool = v[:, :num_obj].mean(dim=1)       # [B,C,3]
+        proxy_pool = v[:, num_obj:].mean(dim=1)     # [B,C,3]
+        pooled = torch.cat([obj_pool, proxy_pool], dim=1)  # [B,2C,3]
+
+        # Predict equivariant vectors
+        vectors = self.vec_head(pooled)             # [B,4,3]
+
+        # Initial rotation
+        r0 = self._orthogonalize(vectors[:, 0], vectors[:, 1])
+
+        # Initial scale from equivariant vector magnitude
+        scale0 = vectors[:, 2].norm(dim=-1).clamp_min(self.min_scale)
+
+        # Joint geometric center of Object and Proxy points
+        joint_center = xyz.mean(dim=1)              # [B,3]
+
+        # Initial translation
+        t0 = joint_center + vectors[:, 3]           # [B,3]
+
+        return r0, t0, scale0
+
+
+
+class InvariantGuidedPoseRefiner(nn.Module):
+    def __init__(self, channels=256, obj_mass=0.75, min_scale=1e-5):
+        super().__init__()
+        if not 0.0 < obj_mass < 1.0:
+            raise ValueError("obj_mass must be strictly between 0 and 1")
+        self.channels = channels
+        self.obj_mass = obj_mass
+        self.min_scale = min_scale
+
+        # q_inv, initial-frame xyz, nocs, residual, ||residual||, type marker.
+        self.score_head = nn.Sequential(
+            nn.Linear(channels + 11, 128), nn.ReLU(inplace=False),
+            nn.Linear(128, 64), nn.ReLU(inplace=False), nn.Linear(64, 1)
+        )
+        # Learn how much to trust R0, scale0, t0: three dimensionless strengths.
+        self.prior_head = nn.Sequential(
+            nn.Linear(2 * channels + 1, 128), nn.ReLU(inplace=False), nn.Linear(128, 3)
+        )
+        # Regress the *ratio* sx:sy:sz only. Overall scale comes from geometry.
+        self.ratio_head = nn.Sequential(
+            nn.Linear(2 * channels, 128), nn.ReLU(inplace=False), nn.Linear(128, 3)
+        )
+        # Initialize uniform within-branch correspondences and mild priors.
+        nn.init.zeros_(self.score_head[-1].weight)
+        nn.init.zeros_(self.score_head[-1].bias)
+        nn.init.zeros_(self.prior_head[-1].weight)
+        nn.init.constant_(self.prior_head[-1].bias, -2.2)
+
+    def forward(self, xyz, nocs, q_inv, r0, t0, scale0, num_obj, detach_nocs=True):
+        b, n, d = xyz.shape
+        if d != 3 or nocs.shape != xyz.shape or q_inv.shape != (b, n, self.channels):
+            raise ValueError("xyz/nocs/q_inv shapes do not agree")
+        if r0.shape != (b, 3, 3) or t0.shape != (b, 3) or scale0.shape != (b,):
+            raise ValueError("Initial pose has unexpected shape")
+        if not 0 < num_obj < n:
+            raise ValueError("Must have both Object and Proxy keypoints")
+
+        # At the beginning, let NOCS be trained by its own supervision.
+        z = nocs.detach() if detach_nocs else nocs
+
+        # Convert camera/local points into the initial canonical reference frame.
+        # Row-vector convention: y = (x - t0) @ R0 / scale0.
+        y = torch.bmm(xyz - t0[:, None], r0) / scale0[:, None, None].clamp_min(self.min_scale)
+        residual = y - z
+        residual_norm = residual.norm(dim=-1, keepdim=True)
+        obj_type = torch.zeros_like(residual_norm)
+        obj_type[:, num_obj:] = 1.0
+        score_in = torch.cat([q_inv, y, z, residual, residual_norm, obj_type], dim=-1)
+        logits = self.score_head(score_in).squeeze(-1)
+
+        # Fixed total mass per branch prevents the more numerous points from dominating.
+        w_obj = logits[:, :num_obj].softmax(dim=1) * self.obj_mass
+        w_proxy = logits[:, num_obj:].softmax(dim=1) * (1.0 - self.obj_mass)
+        weights = torch.cat([w_obj, w_proxy], dim=1)          # [B,N]; sums to 1
+
+        obj_inv = q_inv[:, :num_obj].mean(dim=1)
+        proxy_inv = q_inv[:, num_obj:].mean(dim=1)
+        global_inv = torch.cat([obj_inv, proxy_inv], dim=-1)  # [B,2C]
+        global_res = (weights * residual_norm.squeeze(-1)).sum(dim=1, keepdim=True)
+        strengths = torch.sigmoid(self.prior_head(torch.cat([global_inv, global_res], dim=-1)))
+        prior_rot, prior_scale, prior_trans = strengths.unbind(dim=-1)
+
+        # Weighted centroids, all expressed in the initialization reference frame.
+        mu_y = (weights[..., None] * y).sum(dim=1)  # [B,3]
+        mu_z = (weights[..., None] * z).sum(dim=1)
+        yc, zc = y - mu_y[:, None], z - mu_z[:, None]
+
+        # H = sum w * (y - mean_y) (z - mean_z)^T.
+        H = torch.bmm((weights[..., None] * yc).transpose(1, 2), zc)  # [B,3,3]
+        var_z = (weights * zc.square().sum(dim=-1)).sum(dim=1)        # [B]
+
+        # An identity prior on the *relative* rotation preserves first-stage influence.
+        eye = torch.eye(3, dtype=H.dtype, device=H.device).expand(b, 3, 3)
+        # Small diagonal anisotropic jitter avoids identical singular values at zero H.
+        jitter = H.new_tensor([1e-5, 2e-5, 3e-5]).view(1, 3)
+        H_prior = H + (prior_rot * var_z + 1e-5)[:, None, None] * eye
+        H_prior = H_prior + torch.diag_embed(jitter.expand(b, -1))
+
+        # SVD and reflection handling; fit y ~= gamma * R_delta * z + delta.
+        U, _, Vh = torch.linalg.svd(H_prior, full_matrices=False)
+        uv = U @ Vh
+        handedness = (torch.cross(uv[:, 0], uv[:, 1], dim=-1) * uv[:, 2]).sum(dim=-1)
+        reflection = torch.where(handedness < 0, -torch.ones_like(handedness), torch.ones_like(handedness))
+        d_fix = torch.stack([torch.ones_like(reflection), torch.ones_like(reflection), reflection], dim=-1)
+        R_delta = U @ torch.diag_embed(d_fix) @ Vh
+
+        # Scalar scale anchored to gamma=1: no unrestricted scale explosion for bad NOCS.
+        scale_prior = prior_scale * var_z + 1e-5
+        gamma_num = (R_delta * H).sum(dim=(-2, -1)) + scale_prior
+        gamma = (gamma_num / (var_z + scale_prior)).clamp(min=0.25, max=4.0)
+
+        # Translation anchored to delta=0, i.e. to initial t0.
+        mu_z_rot = torch.bmm(mu_z[:, None], R_delta.transpose(1, 2)).squeeze(1)
+        delta = (mu_y - gamma[:, None] * mu_z_rot) / (1.0 + prior_trans[:, None])
+
+        # Compose relative local-frame correction with the equivariant initializer.
+        r = torch.bmm(r0, R_delta)
+        scale = scale0 * gamma
+        t = t0 + scale0[:, None] * torch.bmm(delta[:, None, :], r0.transpose(1, 2)).squeeze(1)
+
+        # Three-axis size vector with norm equal to geometric similarity scale.
+        ratio = F.softplus(self.ratio_head(global_inv)) + 1e-5
+        ratio = F.normalize(ratio, p=2, dim=-1, eps=1e-8)
+        size = scale[:, None] * ratio
+        info = {"weights": weights, "prior_strength": strengths, "relative_scale": gamma}
+        return r, t, size, info
+
+
+class TwoStageSim3PoseEstimator(nn.Module):
+    def __init__(self, channels=256, obj_mass=0.75, detach_nocs=True):
+        super().__init__()
+        self.initializer = EquivariantPoseInitializer(channels=channels)
+        self.refiner = InvariantGuidedPoseRefiner(channels=channels, obj_mass=obj_mass)
+        self.detach_nocs = detach_nocs
+
+    def forward(self, xyz, nocs, q, q_inv, num_obj, return_aux=False):
+        """Outputs r,t,size; optionally also stage-one predictions for auxiliary loss."""
+        # Keep Gram-Schmidt and differentiable SVD in FP32 under AMP.
+        with torch.amp.autocast(device_type=xyz.device.type, enabled=False):
+            r0, t0, scale0 = self.initializer(q.float(), xyz.float(), num_obj)
+            r, t, size, info = self.refiner(
+                xyz.float(), nocs.float(), q_inv.float(),
+                r0.float(), t0.float(), scale0.float(),
+                num_obj, detach_nocs=self.detach_nocs,
+            )
+        if not return_aux:
+            return r, t, size
+        info.update({"r0": r0, "t0": t0, "scale0": scale0})
+        return r, t, size, info

@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from model.losses import ChamferDis, PoseDis, SmoothL1Dis, ChamferDis_wo_Batch
 from utils.data_utils import generate_augmentation
 from model.modules import ModifiedResnet, PointNet2MSG
-from model.Net_modules import PoseSizeEstimator, NOCS_Predictor
+from model.Net_modules import PoseSizeEstimator, NOCS_Predictor, TwoStageSim3PoseEstimator
 from model.sim3_gafa import Sim3GeometricAwareFeatureAggregator
 from simeco.simeco_pipeline import PCTransformer, sim3Reconstructor
 
@@ -42,7 +42,11 @@ class Net(nn.Module):
         )
 
         self.nocs_predictor = NOCS_Predictor(cfg.NOCS_Predictor)
-        self.estimator = PoseSizeEstimator()
+        self.estimator = self.estimator = TwoStageSim3PoseEstimator(
+                                            channels=cfg.GAFA.d_model,
+                                            obj_mass=0.75,
+                                            detach_nocs=True
+                                        )
 
         self.reconstructor = sim3Reconstructor(cfg.Reconstructor)
 
@@ -50,74 +54,76 @@ class Net(nn.Module):
         
     def forward(self, inputs):
         end_points = {}
-
         rgb = inputs['rgb']
         pts = inputs['pts']
         choose = inputs['choose']
         cls = inputs['category_label'].reshape(-1)
         num_obj = self.base_model.num_query
         c = torch.zeros_like(pts[:, :1])
-        
         b = pts.size(0)
-        index = cls + torch.arange(b, dtype=torch.long).cuda() * self.cat_num
-        
-        # rgb feat
+        index = cls.long().to(pts.device) + torch.arange(b, device=pts.device, dtype=torch.long) * self.cat_num
+
+        # RGB features: unchanged from your latest repository
         if self.cfg.rgb_backbone == 'resnet':
-            rgb_local = self.rgb_extractor(rgb) 
+            rgb_local = self.rgb_extractor(rgb)
         elif self.cfg.rgb_backbone == 'dino':
-            dino_feature = self.rgb_extractor.forward_features(rgb)["x_prenorm"][:, 1:]  
+            dino_feature = self.rgb_extractor.forward_features(rgb)['x_prenorm'][:, 1:]
             f_dim = dino_feature.shape[-1]
-            num_patches =int(dino_feature.shape[1]**0.5)
-            dino_feature = dino_feature.reshape(b, num_patches, num_patches, f_dim).permute(0,3,1,2)
-            dino_feature = F.interpolate(dino_feature, size=(num_patches * 14, num_patches * 14), mode='bilinear', align_corners=False) 
-            dino_feature = dino_feature.reshape(b, f_dim, -1) 
+            num_patches = int(dino_feature.shape[1] ** 0.5)
+            dino_feature = dino_feature.reshape(b, num_patches, num_patches, f_dim).permute(0, 3, 1, 2)
+            dino_feature = F.interpolate(dino_feature, size=(num_patches * 14, num_patches * 14), mode='bilinear', align_corners=False)
+            dino_feature = dino_feature.reshape(b, f_dim, -1)
             rgb_local = self.feature_mlp(dino_feature)
         else:
             raise NotImplementedError
-        
 
         d = rgb_local.size(1)
-        rgb_local = rgb_local.view(b, d, -1)
+        rgb_local = rgb_local.reshape(b, d, -1)
         choose = choose.unsqueeze(1).repeat(1, d, 1)
-        rgb_local = torch.gather(rgb_local, 2, choose).contiguous() # b, c, n
+        rgb_local = torch.gather(rgb_local, 2, choose).contiguous()
 
         if self.training:
             delta_r, delta_t, delta_s = generate_augmentation(b)
             pts = (pts - delta_t) / delta_s.unsqueeze(2) @ delta_r
 
-        # pts_local = self.pts_extractor(pts) # b, c, n
-
-        q, coarse_point_cloud, mem, coor, denoise_length = self.base_model(pts, rgb_local)  # B M C 3 and B M 3
-
+        q, coarse_point_cloud, mem, coor, denoise_length = self.base_model(pts, rgb_local)
         clean_length = q.size(1) - denoise_length if denoise_length else q.size(1)
         q, kpt_3d = q[:, :clean_length], coarse_point_cloud[:, :clean_length]
         q, q_inv = self.GAFA(q, kpt_3d, mem, coor)
         obj_q = q[:, :num_obj]
-        obj_inv = q_inv[:, :num_obj]
         obj_3d = kpt_3d[:, :num_obj]
-        proxy_3d = kpt_3d[:, num_obj:]
 
         recon_model, recon_delta = self.reconstructor(obj_q, obj_3d)
+        kpt_nocs = self.nocs_predictor(q_inv, index)  # Object + Proxy jointly
 
-        kpt_nocs = self.nocs_predictor(q_inv, index)
-        r, t, s = self.estimator(obj_3d, kpt_nocs[:, :num_obj].detach(), obj_inv)
+        pose_outputs = self.estimator(
+            kpt_3d, kpt_nocs, q, q_inv, num_obj, return_aux=self.training
+        )
+        if self.training:
+            r, t, s, pose_aux = pose_outputs
+        else:
+            r, t, s = pose_outputs
 
         if self.training:
             end_points['recon_delta'] = recon_delta
-            end_points['pred_kpt_3d'] =  \
-            (kpt_3d @ delta_r.transpose(1, 2)) * delta_s.unsqueeze(2) + delta_t + c
-            end_points['recon_model'] =  \
-            (recon_model.transpose(1, 2) @ delta_r.transpose(1, 2)) * delta_s.unsqueeze(2) + delta_t + c
+            end_points['pred_kpt_3d'] = (kpt_3d @ delta_r.transpose(1, 2)) * delta_s.unsqueeze(2) + delta_t + c
+            end_points['recon_model'] = (recon_model.transpose(1, 2) @ delta_r.transpose(1, 2)) * delta_s.unsqueeze(2) + delta_t + c
             end_points['pred_kpt_nocs'] = kpt_nocs
             end_points['pred_translation'] = delta_t.squeeze(1) + delta_s * torch.bmm(delta_r, t.unsqueeze(2)).squeeze(2) + c.squeeze(1)
             end_points['pred_rotation'] = delta_r @ r
             end_points['pred_size'] = s * delta_s
 
+            # Auxiliary supervision for Stage 1; transform back from augmentation.
+            end_points['pred_init_rotation'] = delta_r @ pose_aux['r0']
+            end_points['pred_init_translation'] = (
+                delta_t.squeeze(1) + delta_s * torch.bmm(delta_r, pose_aux['t0'].unsqueeze(2)).squeeze(2) + c.squeeze(1)
+            )
+            end_points['pred_init_scale'] = pose_aux['scale0'] * delta_s.squeeze(1)
         else:
             end_points['pred_translation'] = t + c.squeeze(1)
             end_points['pred_rotation'] = r
             end_points['pred_size'] = s
-            end_points['pred_kpt_3d'] =  kpt_3d + c
+            end_points['pred_kpt_3d'] = kpt_3d + c
             end_points['kpt_nocs'] = kpt_nocs
 
         return end_points
