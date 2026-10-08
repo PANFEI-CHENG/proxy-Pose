@@ -19,6 +19,50 @@ from .vec_layers import *
 from .transformer_utils import *
 
 
+
+def build_semantic_self_mask(num_obj, num_proxy, num_dn, device):
+    o, p, d = num_obj, num_proxy, num_dn
+    mask = torch.ones(o + p + d, o + p + d, dtype=torch.bool, device=device)
+
+    mask[:o, :o] = False
+    mask[o:o+p, :o+p] = False
+
+    if d > 0:
+        mask[o+p:, :o] = False
+        mask[o+p:, o+p:] = False
+
+    return mask
+
+
+def build_semantic_self_knn(pos, num_obj, num_proxy, num_dn, k, proxy_obj_k=4):
+    o, p, d = num_obj, num_proxy, num_dn
+    proxy_k = k - proxy_obj_k
+
+    if pos.size(1) != o + p + d:
+        raise ValueError("Query count does not match Object/Proxy/Denoising sizes")
+    if not (0 < proxy_obj_k < k) or o < k or p < proxy_k:
+        raise ValueError("Invalid KNN configuration")
+
+    with torch.no_grad():
+        obj_pos = pos[:, :o]
+        proxy_pos = pos[:, o:o+p]
+
+        obj_idx = knn_point(k, obj_pos, obj_pos)
+
+        proxy_obj_idx = knn_point(proxy_obj_k, obj_pos, proxy_pos)
+        proxy_proxy_idx = knn_point(proxy_k, proxy_pos, proxy_pos) + o
+        proxy_idx = torch.cat([proxy_obj_idx, proxy_proxy_idx], dim=-1)
+
+        if d > 0:
+            dn_pos = pos[:, o+p:]
+            dn_context = torch.cat([obj_pos, dn_pos], dim=1)
+            dn_idx = knn_point(k, dn_context, dn_pos)
+            dn_idx = dn_idx + (dn_idx >= o).long() * p
+            return torch.cat([obj_idx, proxy_idx, dn_idx], dim=1)
+
+        return torch.cat([obj_idx, proxy_idx], dim=1)
+
+
 class VecSelfAttnBlockApi(nn.Module):
     """
     Vector-based Self-Attention Block for Equivariant Networks.
@@ -346,53 +390,39 @@ class VecCrossAttnBlockApi(nn.Module):
         else:
             raise RuntimeError(f"Unexpected number of attention features: {len(attn_features)}")
 
-    def forward(self, q, v, q_pos, v_pos, self_attn_idx=None, cross_attn_idx=None, denoise_length=None):
-        """
-        Forward pass of VecCrossAttnBlockApi.
-        
-        Args:
-            q (torch.Tensor): Query tensor [B, C, 3, N_q]
-            v (torch.Tensor): Value/key tensor [B, C, 3, N_v]
-            q_pos (torch.Tensor): Query positions [B, N_q, 3]
-            v_pos (torch.Tensor): Value positions [B, N_v, 3]
-            self_attn_idx (torch.Tensor): Neighbor indices for self-attention
-            cross_attn_idx (torch.Tensor): Neighbor indices for cross-attention
-            denoise_length (int): Length of denoising queries for masking
-            
-        Returns:
-            torch.Tensor: Output query tensor after self and cross attention
-        """
-        # Create attention mask for denoising task if specified
-        mask = None
-        if denoise_length is not None:
-            query_len = q.size(1)
-            mask = torch.zeros(query_len, query_len).to(q.device)
-            # Prevent denoising queries from attending to reconstruction queries
-            mask[:-denoise_length, -denoise_length:] = 1.
 
-        # Apply self-attention with optional masking
+    def forward(self, q, v, q_pos, v_pos, self_attn_idx=None,
+                cross_attn_idx=None, denoise_length=None, self_attn_mask=None):
+
+        mask = self_attn_mask
+        if mask is None and denoise_length is not None:
+            query_len = q.size(1)
+            mask = torch.zeros(query_len, query_len, dtype=torch.bool, device=q.device)
+            mask[:-denoise_length, -denoise_length:] = True
+
+        # Self-Attention
         q = self.apply_attention(
-            x=q, pos=q_pos, idx=self_attn_idx, 
-            attn=self.self_attn, local_attn=self.local_self_attn, 
+            x=q, pos=q_pos, idx=self_attn_idx,
+            attn=self.self_attn, local_attn=self.local_self_attn,
             merge_map=self.self_attn_merge_map, mask=mask,
             layer_scale=self.ls1, scale_factor=self.scale_factor
-        ) 
+        )
 
-        # Apply cross-attention between query and value features
+        # Cross-Attention with shared memory
         q = self.apply_attention(
-            x=q, v=v, pos=q_pos, v_pos=v_pos, idx=cross_attn_idx, 
-            attn=self.cross_attn, local_attn=self.local_cross_attn, 
+            x=q, v=v, pos=q_pos, v_pos=v_pos, idx=cross_attn_idx,
+            attn=self.cross_attn, local_attn=self.local_cross_attn,
             merge_map=self.cross_attn_merge_map, is_cross=True,
             layer_scale=self.ls2, scale_factor=self.scale_factor
         )
 
-        # Apply MLP with residual connection
-        # Permute for vector operations, then restore original format
-        mlp_input = self.norm2(q).permute(0, 2, 3, 1)  # [B, 3, N, C]
-        mlp_output = self.mlp(mlp_input).permute(0, 3, 1, 2)  # Back to [B, C, 3, N]
+        # MLP
+        mlp_input = self.norm2(q).permute(0, 2, 3, 1)
+        mlp_output = self.mlp(mlp_input).permute(0, 3, 1, 2)
         q = q + self.ls2(transform_restore(q, mlp_output, self.scale_factor))
-        
+
         return q
+
 
 
 class TransformerEncoder(nn.Module):
@@ -464,8 +494,9 @@ class TransformerDecoder(nn.Module):
         self_attn_combine_style='concat',
         cross_attn_block_style_list=['vnattn-vngraph'], 
         cross_attn_combine_style='concat',
-        k=10, 
-        mode="so3", 
+        k=10,
+        proxy_obj_k=4,
+        mode="so3",
         bias_epsilon=1e-6, 
         scale_factor=None
     ):
@@ -478,6 +509,7 @@ class TransformerDecoder(nn.Module):
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
             
         self.k = k
+        self.proxy_obj_k = proxy_obj_k
         self.blocks = nn.ModuleList()
         
         # Build decoder blocks
@@ -498,38 +530,34 @@ class TransformerDecoder(nn.Module):
                 bias_epsilon=bias_epsilon
             ))
 
-    def forward(self, q, v, q_pos, v_pos, denoise_length=None):
-        """
-        Forward pass of TransformerDecoder.
-        
-        Args:
-            q (torch.Tensor): Query tensor [B, C, 3, N_q]
-            v (torch.Tensor): Value/key tensor [B, C, 3, N_v]
-            q_pos (torch.Tensor): Query positions [B, N_q, 3]
-            v_pos (torch.Tensor): Value positions [B, N_v, 3]
-            denoise_length (int, optional): Length of denoising queries for masking
-            
-        Returns:
-            torch.Tensor: Output query tensor after cross-attention processing
-        """
-        # Compute neighbor indices for self-attention and cross-attention
-        if denoise_length is None:
-            self_attn_idx = knn_point(self.k, q_pos, q_pos)
-        else:
-            self_attn_idx = None
-        cross_attn_idx = knn_point(self.k, v_pos, q_pos)
-        
-        # Apply cross-attention blocks sequentially
-        for _, block in enumerate(self.blocks):
-            q = block(
-                q=q, 
-                v=v, 
-                q_pos=q_pos, 
-                v_pos=v_pos, 
-                self_attn_idx=self_attn_idx, 
-                cross_attn_idx=cross_attn_idx, 
-                denoise_length=denoise_length
+
+    def forward(self, q, v, q_pos, v_pos, denoise_length=None,
+                num_object_queries=None, num_proxy_queries=None):
+
+        if num_object_queries is not None and num_proxy_queries is not None:
+            o = int(num_object_queries)
+            p = int(num_proxy_queries)
+            d = int(denoise_length or 0)
+
+            self_attn_mask = build_semantic_self_mask(o, p, d, q_pos.device)
+            self_attn_idx = build_semantic_self_knn(
+                q_pos, o, p, d, self.k, self.proxy_obj_k
             )
+        else:
+            self_attn_mask = None
+            self_attn_idx = knn_point(self.k, q_pos, q_pos) if denoise_length is None else None
+
+        cross_attn_idx = knn_point(self.k, v_pos, q_pos)
+
+        for block in self.blocks:
+            q = block(
+                q=q, v=v, q_pos=q_pos, v_pos=v_pos,
+                self_attn_idx=self_attn_idx,
+                cross_attn_idx=cross_attn_idx,
+                denoise_length=denoise_length,
+                self_attn_mask=self_attn_mask
+            )
+
         return q
 
 
@@ -653,7 +681,8 @@ class PointTransformerDecoder(nn.Module):
         self_attn_combine_style='concat',
         cross_attn_block_style_list=['vnattn-vngraph'], 
         cross_attn_combine_style='concat',
-        k=10,  
+        k=10,
+        proxy_obj_k=4,
         mode="so3",
         bias_epsilon=1e-6, 
         scale_factor=None
@@ -702,7 +731,8 @@ class PointTransformerDecoder(nn.Module):
             self_attn_combine_style=self_attn_combine_style,
             cross_attn_block_style_list=cross_attn_block_style_list, 
             cross_attn_combine_style=cross_attn_combine_style,
-            k=k, 
+            k=k,
+            proxy_obj_k=proxy_obj_k,
             mode=mode,
             bias_epsilon=bias_epsilon,
             scale_factor=scale_factor
@@ -722,7 +752,8 @@ class PointTransformerDecoder(nn.Module):
         elif isinstance(m, VecLinear):
             trunc_normal_(m.weight, std=.02)
 
-    def forward(self, q, v, q_pos, v_pos, denoise_length=None):
+    def forward(self, q, v, q_pos, v_pos, denoise_length=None,
+                num_object_queries=None, num_proxy_queries=None):
         """
         Forward pass of PointTransformerDecoder.
         
@@ -736,7 +767,11 @@ class PointTransformerDecoder(nn.Module):
         Returns:
             torch.Tensor: Output query tensor after cross-attention processing
         """
-        q = self.blocks(q, v, q_pos, v_pos, denoise_length=denoise_length)
+        q = self.blocks(
+            q, v, q_pos, v_pos, denoise_length=denoise_length,
+            num_object_queries=num_object_queries,
+            num_proxy_queries=num_proxy_queries,
+        )
         return q
 
 
@@ -1294,7 +1329,8 @@ class PCTransformer(nn.Module):
         q = self.mlp_query(torch.cat([global_query, query_points.unsqueeze(2)], dim=-2)
                            .permute(0, 2, 3, 1).contiguous())
         q = self.decoder(q=q.permute(0, 3, 1, 2).contiguous(), v=mem,
-                         q_pos=query_points, v_pos=coor, denoise_length=denoise_length)
+                         q_pos=query_points, v_pos=coor, denoise_length=denoise_length,
+                         num_object_queries=self.num_query, num_proxy_queries=self.skeleton_num)
         return q, query_points, mem, coor, denoise_length or 0
 
 

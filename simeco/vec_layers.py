@@ -652,13 +652,21 @@ class Attend(nn.Module):
         """
         scale = q.shape[-1] ** -0.5
         
-        # Expand mask dimensions if needed
-        if exists(mask):
-            mask = rearrange(mask, 'b j -> b 1 1 j')
 
-        # Use flash attention if enabled
+        # True means the key is blocked
+        if exists(mask):
+            if mask.ndim == 2:
+                mask = mask.unsqueeze(0).unsqueeze(0)
+            elif mask.ndim == 3:
+                mask = mask.unsqueeze(1)
+            elif mask.ndim != 4:
+                raise ValueError(f"Unexpected attention mask shape: {mask.shape}")
+            mask = mask.bool()
+
+        # PyTorch SDPA boolean mask: True means allowed
         if self.flash:
-            return self.flash_attn(q, k, v, mask=mask)
+            return self.flash_attn(q, k, v, mask=(~mask if mask is not None else None))
+
 
         # Standard attention computation
         sim = einsum(f"b h i d, b h j d -> b h i j", q, k) * scale

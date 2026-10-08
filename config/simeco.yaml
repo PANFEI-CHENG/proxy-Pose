@@ -28,6 +28,7 @@ decoder_config:
   depth: 2
   num_heads: 4
   k: 8
+  proxy_obj_k: 4
   mlp_ratio: 2.
   self_attn_block_style_list: ['vnattn-vngraph', 'vnattn']
   self_attn_combine_style: 'concat'

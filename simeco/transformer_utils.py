@@ -112,10 +112,6 @@ class VNAttention(nn.Module):
         # Reshape for multi-head attention: [B, H, N, (D*C)] where H=num_heads, D=C/H
         q, k, v = map(lambda t:  einops.rearrange(t, 'b (h d) c n-> b h n (d c)', h = self.num_heads), (q, k, v))
        
-        # Handle optional attention mask
-        if mask is not None:
-            # Expand mask to match batch size
-            mask = mask[0].unsqueeze(0).expand(x.size(0), -1)
             
         # Apply attention mechanism
         x = self.attend(q, k, v, mask = mask)
