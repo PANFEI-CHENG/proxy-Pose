@@ -53,7 +53,7 @@ class Net(nn.Module):
         pts = inputs['pts']
         choose = inputs['choose']
         cls = inputs['category_label'].reshape(-1)
-
+        num_obj = self.base_model.num_query
         c = torch.zeros_like(pts[:, :1])
         
         b = pts.size(0)
@@ -90,9 +90,15 @@ class Net(nn.Module):
         clean_length = q.size(1) - denoise_length if denoise_length else q.size(1)
         q, kpt_3d = q[:, :clean_length], coarse_point_cloud[:, :clean_length]
         q, q_inv = self.GAFA(q, kpt_3d, mem, coor)
-        recon_model, recon_delta = self.reconstructor(q, kpt_3d)
-        kpt_nocs = self.nocs_predictor(q_inv, index)
-        r, t, s = self.estimator(kpt_3d, kpt_nocs.detach(), q_inv)
+        obj_q = q[:, :num_obj]
+        obj_inv = q_inv[:, :num_obj]
+        obj_3d = kpt_3d[:, :num_obj]
+        proxy_3d = kpt_3d[:, num_obj:]
+
+        recon_model, recon_delta = self.reconstructor(obj_q, obj_3d)
+
+        kpt_nocs = self.nocs_predictor(obj_inv, index)
+        r, t, s = self.estimator(obj_3d, kpt_nocs.detach(), obj_inv)
 
         if self.training:
             end_points['recon_delta'] = recon_delta
