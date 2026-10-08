@@ -7,8 +7,8 @@ train_dataset:
   image_size: 224       # [192, 224]
   sample_num: 1024
   outlier_th: 0.1
-  syn_bs: 30
-  real_bs: 10
+  syn_bs: 18
+  real_bs: 6
   syn_num_workers: 12
   real_num_workers: 4
   shuffle: True

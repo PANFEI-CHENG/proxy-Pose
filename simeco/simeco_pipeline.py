@@ -2,11 +2,17 @@ import torch
 import torch.nn as nn
 from functools import partial
 
-from timm.models.layers import trunc_normal_
-from pointnet2_ops import pointnet2_utils
+try:
+    from timm.models.layers import trunc_normal_
+except ImportError:
+    from torch.nn.init import trunc_normal_
+try:
+    from pointnet2_ops import pointnet2_utils
+except ImportError:
+    # AG-Pose already ships the legacy PointNet2 extension under this name.
+    import pointnet2_utils
 
-from extensions.chamfer_dist import ChamferDistanceL1
-from utils import misc 
+from . import misc
 
 from . import MODELS
 from .vec_layers import *
@@ -745,177 +751,227 @@ class PointTransformerDecoderEntry(PointTransformerDecoder):
 
 
 class VecDGCNN(nn.Module):
-    def __init__(self, k=16, bias_epsilon=1e-6):
-        """
-        VecDGCNN with k-NN-based graph feature extraction.
-
-        Args:
-            k (int): Number of nearest neighbors. Default is 16.
-            bias_epsilon (float): Small constant for numerical stability.
-        """
+    def __init__(self, k=16, bias_epsilon=1e-6, rgb_dim=None):
         super().__init__()
         self.k = k
-        
-        act_func = nn.LeakyReLU(negative_slope=0.2, inplace=False)
-        
-        # Convolutional layers with normalization and activation
-        self.conv1 = VecLinearNormalizeActivate(
-            2, 32, mode="se3", act_func=act_func, bias_epsilon=bias_epsilon
-        )
-        self.conv2 = VecLinearNormalizeActivate(
-            64, 64, mode="se3", act_func=act_func, bias_epsilon=bias_epsilon
-        )
-        self.conv3 = VecLinearNormalizeActivate(
-            128, 64, mode="se3", act_func=act_func, bias_epsilon=bias_epsilon
-        )
-        self.conv4 = VecLinearNormalizeActivate(
-            128, 128, mode="se3", act_func=act_func, bias_epsilon=bias_epsilon
-        )
+        self.rgb_dim = rgb_dim
 
-        # Pooling layers
+        act_func = nn.LeakyReLU(negative_slope=0.2, inplace=False)
+
+        # Geometry branch
+        self.conv1 = VecLinearNormalizeActivate(2, 32, mode="se3", act_func=act_func, bias_epsilon=bias_epsilon)
+        self.conv2 = VecLinearNormalizeActivate(64, 64, mode="se3", act_func=act_func, bias_epsilon=bias_epsilon)
+        self.conv3 = VecLinearNormalizeActivate(128, 64, mode="se3", act_func=act_func, bias_epsilon=bias_epsilon)
+        self.conv4 = VecLinearNormalizeActivate(128, 128, mode="se3", act_func=act_func, bias_epsilon=bias_epsilon)
+
         self.pool1 = VecMaxPool(32, mode="se3", bias_epsilon=bias_epsilon)
         self.pool2 = VecMaxPool(64, mode="se3", bias_epsilon=bias_epsilon)
         self.pool3 = VecMaxPool(64, mode="se3", bias_epsilon=bias_epsilon)
         self.pool4 = VecMaxPool(128, mode="se3", bias_epsilon=bias_epsilon)
-    
+
         self.num_features = 128
-        
+
+        # RGB branch, keeps [B, C_rgb, N]
+        if rgb_dim is not None:
+            self.rgb_mlp1 = self._make_rgb_mlp(rgb_dim)
+            self.rgb_mlp2 = self._make_rgb_mlp(rgb_dim)
+            self.rgb_mlp3 = self._make_rgb_mlp(rgb_dim)
+            self.rgb_mlp4 = self._make_rgb_mlp(rgb_dim)
+        else:
+            self.rgb_mlp1 = None
+            self.rgb_mlp2 = None
+            self.rgb_mlp3 = None
+            self.rgb_mlp4 = None
+
     @staticmethod
-    def fps_downsample(coor, x, num_group):
+    def _make_rgb_mlp(dim):
+        return nn.Sequential(
+            nn.Conv1d(dim, dim, 1),
+            nn.GELU(),
+            nn.Conv1d(dim, dim, 1)
+        )
+
+    @staticmethod
+    def _update_rgb(rgb_local, mlp):
+        if rgb_local is None or mlp is None:
+            return rgb_local
+        return rgb_local + mlp(rgb_local)
+
+    @staticmethod
+    def fps_downsample(coor, x, num_group, rgb_local=None):
         """
-        Performs farthest point sampling (FPS) on point clouds.
-
-        Args:
-            coor (torch.Tensor): Coordinates [B, 3, N].
-            x (torch.Tensor): Features [B, C, 3, N] (C-dimensional 3D vector features).
-            num_group (int): Number of sampled points.
-
-        Returns:
-            new_coor (torch.Tensor): Sampled coordinates [B, 3, num_group].
-            new_x (torch.Tensor): Sampled features [B, C, 3, num_group].
+        coor:      [B, 3, N]
+        x:         [B, C, 3, N]
+        rgb_local: [B, C_rgb, N] or None
         """
-        xyz = coor.transpose(1, 2).contiguous()  # [B, N, 3]
-        fps_idx = pointnet2_utils.furthest_point_sample(xyz, num_group)  # [B, num_group]
 
-        B, C, D, N = x.shape  # D = 3
-        x_reshaped = x.view(B, C * D, N)  
-        combined_x = torch.cat([coor, x_reshaped], dim=1)  # [B, 3 + C*3, N]
-        new_combined_x = pointnet2_utils.gather_operation(
-            combined_x, fps_idx
-        )  # [B, 3 + C*3, num_group]
-        new_coor = new_combined_x[:, :3, :]  # [B, 3, num_group]
-        new_x = new_combined_x[:, 3:, :].view(B, C, D, num_group)  # [B, C, 3, num_group]
+        xyz = coor.transpose(1, 2).contiguous()
+        fps_idx = pointnet2_utils.furthest_point_sample(xyz, num_group)
 
-        return new_coor, new_x
+        B, C, D, N = x.shape
+        x_reshaped = x.view(B, C * D, N)
+
+        combined_x = torch.cat([coor, x_reshaped], dim=1)
+        new_combined_x = pointnet2_utils.gather_operation(combined_x, fps_idx)
+
+        new_coor = new_combined_x[:, :3, :]
+        new_x = new_combined_x[:, 3:, :].view(B, C, D, num_group)
+
+        new_rgb_local = None
+
+        if rgb_local is not None:
+            if rgb_local.dim() != 3:
+                raise ValueError(f"rgb_local must be [B, C_rgb, N], got {rgb_local.shape}")
+
+            if rgb_local.shape[0] != B or rgb_local.shape[2] != N:
+                raise ValueError(
+                    f"xyz and rgb_local are not aligned: "
+                    f"xyz points={N}, rgb_local={rgb_local.shape}"
+                )
+
+            new_rgb_local = pointnet2_utils.gather_operation(
+                rgb_local.contiguous(), fps_idx
+            )
+
+        return new_coor, new_x, new_rgb_local
 
     def get_graph_feature(self, coor_q, x_q, coor_k, x_k):
         """
-        Computes graph features using k-NN.
+        coor_q: [B, 3, M]
+        x_q:    [B, C, 3, M]
+        coor_k: [B, 3, N]
+        x_k:    [B, C, 3, N]
 
-        Args:
-            coor_q (torch.Tensor): Query coordinates [B, 3, M].
-            x_q (torch.Tensor): Query features [B, C, 3, M].
-            coor_k (torch.Tensor): Key coordinates [B, 3, N].
-            x_k (torch.Tensor): Key features [B, C, 3, N].
-
-        Returns:
-            torch.Tensor: Graph features with shape [B, C*2, 3, M, k].
+        return: [B, 2C, 3, M, k]
         """
-        # Center the features for translation invariance
+
         bias = x_k.mean(dim=-1, keepdim=True)
         x_q = x_q - bias
         x_k = x_k - bias
-        
+
         k = self.k
         batch_size = x_k.size(0)
         num_points_k = x_k.size(-1)
         num_points_q = x_q.size(-1)
-        
-        # Find k-nearest neighbors
+
         with torch.no_grad():
             idx = knn_point(
-                k, 
-                coor_k.transpose(-1, -2).contiguous(), 
+                k,
+                coor_k.transpose(-1, -2).contiguous(),
                 coor_q.transpose(-1, -2).contiguous()
-            )  # [B, M, k]
-            idx = idx.transpose(-1, -2).contiguous()  # [B, k, M]
+            )
+
+            idx = idx.transpose(-1, -2).contiguous()
             assert idx.shape[1] == k
-            
-            # Create base indices for batched indexing
+
             idx_base = torch.arange(
-                0, batch_size, device=x_q.device
+                batch_size, device=x_q.device
             ).view(-1, 1, 1) * num_points_k
-            idx = idx + idx_base
-            idx = idx.view(-1)
-        
-        # Gather neighbor features
+
+            idx = (idx + idx_base).view(-1)
+
         num_dims = x_k.size(1)
-        feature = x_k.permute(0, 3, 1, 2).contiguous().view(
-            batch_size * num_points_k, num_dims, -1
-        )[idx, :, :]
-        
-        # Reshape to [B, k, M, C, 3] then permute to [B, C, 3, M, k]
-        feature = feature.view(
-            batch_size, k, num_points_q, num_dims, -1
-        ).permute(0, 3, 4, 2, 1).contiguous()
-        
-        # Expand query features to match neighbor dimension
-        x_q = x_q.view(batch_size, num_dims, 3, num_points_q, 1).expand(-1, -1, -1, -1, k)
-        
-        # Concatenate relative and absolute features
+
+        feature = x_k.permute(0, 3, 1, 2).contiguous()
+        feature = feature.view(batch_size * num_points_k, num_dims, -1)[idx]
+        feature = feature.view(batch_size, k, num_points_q, num_dims, -1)
+        feature = feature.permute(0, 3, 4, 2, 1).contiguous()
+
+        x_q = x_q.view(
+            batch_size, num_dims, 3, num_points_q, 1
+        ).expand(-1, -1, -1, -1, k)
+
         feature = torch.cat((feature - x_q, x_q), dim=1)
-        
-        # Add back the bias for both relative and absolute features
         feature = feature + torch.cat((bias, bias), dim=1).unsqueeze(-1)
-        
+
         return feature
 
-    def forward(self, x, num):
+    def forward(self, x, num, rgb_local=None):
         """
-        Forward pass of VecDGCNN.
-        
-        Args:
-            x (torch.Tensor): Input point cloud [B, N, 3]
-            num (list): Number of points for downsampling, e.g., [1024, 512]
-            
-        Returns:
-            coor (torch.Tensor): Output coordinates [B, N_final, 3]
-            f (torch.Tensor): Output features [B, C, 3, N_final]
+        x:         [B, N, 3]
+        rgb_local: [B, C_rgb, N] or None
+
+        Example:
+            x         = [40, 1024, 3]
+            rgb_local = [40, 128, 1024]
         """
-        # Reshape input: [B, N, 3] -> [B, 3, N] for coordinates
-        coor = x.transpose(-1, -2).contiguous()  # [B, 3, N]
-        x = x.transpose(-1, -2).unsqueeze(1).contiguous()  # [B, 1, 3, N]
-   
-        # First convolution block
+
+        has_rgb = rgb_local is not None
+
+        if has_rgb:
+            if self.rgb_dim is None:
+                raise ValueError("rgb_local is provided, but rgb_dim=None.")
+
+            if rgb_local.dim() != 3:
+                raise ValueError(f"rgb_local must be [B, C_rgb, N], got {rgb_local.shape}")
+
+            if rgb_local.shape[0] != x.shape[0] or rgb_local.shape[2] != x.shape[1]:
+                raise ValueError(
+                    f"rgb_local must correspond to xyz: "
+                    f"xyz={x.shape}, rgb_local={rgb_local.shape}"
+                )
+
+            if rgb_local.shape[1] != self.rgb_dim:
+                raise ValueError(
+                    f"Expected rgb_dim={self.rgb_dim}, got {rgb_local.shape[1]}"
+                )
+
+        # xyz: [B,N,3] -> [B,3,N]
+        coor = x.transpose(-1, -2).contiguous()
+
+        # vector feature: [B,1,3,N]
+        x = x.transpose(-1, -2).unsqueeze(1).contiguous()
+
+        # Stage 1
         f = self.get_graph_feature(coor, x, coor, x)
         f = self.conv1(f)
         f = self.pool1(f)
-        
-        # First downsampling
-        coor_q, f_q = self.fps_downsample(coor, f, num_group=num[0])
+
+        if has_rgb:
+            rgb_local = self._update_rgb(rgb_local, self.rgb_mlp1)
+
+        # FPS 1
+        coor_q, f_q, rgb_local = self.fps_downsample(
+            coor, f, num[0], rgb_local
+        )
+
+        # Stage 2
         f = self.get_graph_feature(coor_q, f_q, coor, f)
-        
-        # Second convolution block
         f = self.conv2(f)
         f = self.pool2(f)
         coor = coor_q
 
-        # Third convolution block (self-attention)
+        if has_rgb:
+            rgb_local = self._update_rgb(rgb_local, self.rgb_mlp2)
+
+        # Stage 3
         f = self.get_graph_feature(coor, f, coor, f)
         f = self.conv3(f)
         f = self.pool3(f)
 
-        # Second downsampling and final convolution
-        coor_q, f_q = self.fps_downsample(coor, f, num_group=num[1])
+        if has_rgb:
+            rgb_local = self._update_rgb(rgb_local, self.rgb_mlp3)
+
+        # FPS 2
+        coor_q, f_q, rgb_local = self.fps_downsample(
+            coor, f, num[1], rgb_local
+        )
+
+        # Stage 4
         f = self.get_graph_feature(coor_q, f_q, coor, f)
         f = self.conv4(f)
         f = self.pool4(f)
-        
-        # Final coordinate reshaping: [B, 3, N] -> [B, N, 3]
-        coor = coor_q.transpose(2, 1).contiguous()
-        
-        return coor, f
 
+        if has_rgb:
+            rgb_local = self._update_rgb(rgb_local, self.rgb_mlp4)
+
+        # [B,3,M] -> [B,M,3]
+        coor = coor_q.transpose(2, 1).contiguous()
+
+        if has_rgb:
+            return coor, f, rgb_local
+
+        return coor, f
 
 class SimpleRebuildFCLayer(nn.Module):
     """
@@ -1061,15 +1117,28 @@ class PCTransformer(nn.Module):
         self.mode = getattr(config, 'mode', "sim3")
         self.encoder_type = config.encoder_type
         self.bias_epsilon = getattr(config, 'bias_epsilon', 1e-6)
+        self.rgb_dim = getattr(config, 'rgb_dim', None)
+
+        self.skeleton_num = getattr(config, 'skeleton_num', 36)
+
         
         assert self.encoder_type == 'vecgraph', f'unexpected encoder_type {self.encoder_type}'
         act_func = nn.LeakyReLU(negative_slope=0.2, inplace=False)
         self.num_query = query_num = config.num_query
         global_feature_dim = config.global_feature_dim
 
+        if self.rgb_dim is not None:
+            self.rgb_global_proj = nn.Sequential(
+                nn.Conv1d(self.rgb_dim, global_feature_dim, 1),
+                nn.GELU(),
+                nn.Conv1d(global_feature_dim, global_feature_dim, 1)
+            )
+            self.global_lin_ori = VecLinear(global_feature_dim, global_feature_dim, mode=self.mode, bias_epsilon=self.bias_epsilon)
+        else:
+            self.rgb_global_proj = None
         # Base encoder
         if self.encoder_type == 'vecgraph':
-            self.grouper = VecDGCNN(bias_epsilon=self.bias_epsilon)
+            self.grouper = VecDGCNN(bias_epsilon=self.bias_epsilon, rgb_dim=self.rgb_dim)
         else:
             raise NotImplementedError(f'encoder_type {self.encoder_type} not implemented')
             
@@ -1085,6 +1154,9 @@ class PCTransformer(nn.Module):
             VecLinear(v_in=512, v_out=encoder_config.embed_dim, mode=self.mode, bias_epsilon=self.bias_epsilon),
         )
 
+        self.skeleton_query = nn.Parameter(torch.empty(1, global_feature_dim))
+        nn.init.xavier_normal_(self.skeleton_query)
+
         self.encoder = PointTransformerEncoderEntry(encoder_config)
         
         self.increase_dim = nn.Sequential(
@@ -1097,6 +1169,13 @@ class PCTransformer(nn.Module):
             VecLinear(v_in=global_feature_dim, v_out=1024, mode=self.mode, bias_epsilon=self.bias_epsilon),
             VecActivation(1024, act_func=act_func, mode=self.mode, bias_epsilon=self.bias_epsilon),
             VecLinear(v_in=1024, v_out=query_num, mode=self.mode, bias_epsilon=self.bias_epsilon),
+        )
+
+        self.global_lin_ori2 = VecLinear(global_feature_dim, global_feature_dim, mode=self.mode, bias_epsilon=self.bias_epsilon)
+        self.skeleton_pred = nn.Sequential(
+            VecLinear(v_in=global_feature_dim, v_out=1024, mode=self.mode, bias_epsilon=self.bias_epsilon),
+            VecActivation(1024, act_func=act_func, mode=self.mode, bias_epsilon=self.bias_epsilon),
+            VecLinear(v_in=1024, v_out=self.skeleton_num, mode=self.mode, bias_epsilon=self.bias_epsilon),
         )
         
         self.mlp_query = nn.Sequential(
@@ -1134,8 +1213,17 @@ class PCTransformer(nn.Module):
 
     def forward(self, xyz, rgb_local=None):
         # Extract features using graph-based encoder
-        coor, f = self.grouper(xyz, self.center_num)
-        
+        if rgb_local is not None:
+            coor, f, rgb_local = self.grouper(xyz, self.center_num, rgb_local)
+
+            # rgb_local: [B,M,128] -> [B,128,1,M]
+            rgb_weight = rgb_local.unsqueeze(2).contiguous()
+
+            # Preserve translation-related component
+            bias = f.mean(dim=-1, keepdim=True)
+            f = (f - bias) * rgb_weight + bias
+        else:
+            coor, f = self.grouper(xyz, self.center_num)
         # Project input features to embedding dimension
         x = self.input_proj(f)
         
@@ -1153,9 +1241,28 @@ class PCTransformer(nn.Module):
         # Extract global features
         global_feature = self.increase_dim(x.permute(0, 2, 3, 1).contiguous())
         global_feature = self.pool(global_feature)
-        
+
+        # Global RGB-geometry fusion
+        if rgb_local is not None:
+            rgb_global = rgb_local.mean(dim=-1, keepdim=True)
+            # [B,128,1]
+
+            rgb_global = self.rgb_global_proj(rgb_global)
+            # [B,512,1]
+
+            rgb_weight = rgb_global
+            # [B,512,1,1]
+            global_origin = self.global_lin_ori(global_feature)
+
+            global_feature = (global_feature - global_origin) * rgb_weight + global_origin
+
         # Predict coarse point cloud
         coarse = self.coarse_pred(global_feature)
+
+        global_origin2 = self.global_lin_ori2(global_feature)
+        global_feature2 = (global_feature - global_origin2) * self.skeleton_query.unsqueeze(-1) + global_origin2
+
+        skeleton_points = self.skeleton_pred(global_feature2)
         
         # Apply query selection if enabled
         if self.query_selection:
@@ -1169,56 +1276,90 @@ class PCTransformer(nn.Module):
 
         # Prepare memory features for decoder
         mem = self.mem_link(x.permute(0, 2, 3, 1).contiguous()).permute(0, 3, 1, 2).contiguous()
-       
-        if self.training:
-            # Add denoising task during training
-            if self.denoise_length > 0:
-                picked_points = misc.fps(xyz.contiguous(), self.denoise_length)
-                picked_points = misc.jitter_points(picked_points)
-                coarse = torch.cat([coarse, picked_points], dim=1)
-                denoise_length = self.denoise_length
-            else:
-                denoise_length = None
 
-            # Generate query features
-            q = self.mlp_query(
-                torch.cat(
-                    [
-                        global_feature.unsqueeze(1).expand(-1, coarse.size(1), -1, -1),
-                        coarse.unsqueeze(2),
-                    ],
-                    dim=-2,
-                )
-                .permute(0, 2, 3, 1)
-                .contiguous()
-            )
-            q = q.permute(0, 3, 1, 2).contiguous()
-            
-            # Apply transformer decoder
-            q = self.decoder(
-                q=q, v=mem, q_pos=coarse, v_pos=coor, denoise_length=denoise_length
-            )
-            
-            return q, coarse, self.denoise_length
-        else:
-            # Generate query features for inference
-            q = self.mlp_query(
-                torch.cat(
-                    [
-                        global_feature.unsqueeze(1).expand(-1, coarse.size(1), -1, -1),
-                        coarse.unsqueeze(2),
-                    ],
-                    dim=-2,
-                )
-                .permute(0, 2, 3, 1)
-                .contiguous()
-            )
-            q = q.permute(0, 3, 1, 2).contiguous()
-            
-            # Apply transformer decoder
-            q = self.decoder(q=q, v=mem, q_pos=coarse, v_pos=coor)
-            return q, coarse, 0
+        # Query order: [coarse, skeleton, denoise]. Denoise queries must stay last.
+        query_points = torch.cat([coarse, skeleton_points], dim=1)
+        global_query = torch.cat([
+            global_feature.unsqueeze(1).expand(-1, coarse.size(1), -1, -1),
+            global_feature2.unsqueeze(1).expand(-1, skeleton_points.size(1), -1, -1),
+        ], dim=1)
+        denoise_length = self.denoise_length if self.training and self.denoise_length > 0 else None
+        if denoise_length:
+            noisy_points = misc.jitter_points(misc.fps(xyz.contiguous(), denoise_length))
+            query_points = torch.cat([query_points, noisy_points], dim=1)
+            global_query = torch.cat([
+                global_query, global_feature.unsqueeze(1).expand(-1, denoise_length, -1, -1)
+            ], dim=1)
 
+        q = self.mlp_query(torch.cat([global_query, query_points.unsqueeze(2)], dim=-2)
+                           .permute(0, 2, 3, 1).contiguous())
+        q = self.decoder(q=q.permute(0, 3, 1, 2).contiguous(), v=mem,
+                         q_pos=query_points, v_pos=coor, denoise_length=denoise_length)
+        return q, query_points, mem, coor, denoise_length or 0
+
+
+class sim3Reconstructor(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.pts_per_kpt = cfg.pts_per_kpt
+        self.ndim = cfg.ndim
+        self.mode = getattr(cfg, 'mode', 'sim3')
+        self.bias_epsilon = getattr(cfg, 'bias_epsilon', 1e-6)
+
+        self.increase_dim = nn.Sequential(
+            VecLinear(self.ndim, 1024, mode=self.mode, bias_epsilon=self.bias_epsilon),
+            VecActivation(1024, act_func=nn.LeakyReLU(0.2), mode=self.mode, bias_epsilon=self.bias_epsilon),
+            VecLinear(1024, 1024, mode=self.mode, bias_epsilon=self.bias_epsilon),
+        )
+
+        self.pool = VecMaxPool(1024, mode=self.mode, bias_epsilon=self.bias_epsilon)
+
+        self.reduce_map = nn.Sequential(
+            VecLinear(self.ndim + 1025, self.ndim, mode=self.mode, bias_epsilon=self.bias_epsilon),
+        )
+
+        self.decode_head = SimpleRebuildFCLayer(
+            2 * self.ndim, step=self.pts_per_kpt, bias_epsilon=self.bias_epsilon
+        )
+
+    def forward(self, q, kpt_3d):
+        """
+        Args:
+            q: (B, M, C, 3)
+            kpt_3d: (B, M, 3)
+
+        Returns:
+            recon_model: (B, 3, M * pts_per_kpt)
+            recon_delta: (B, M * pts_per_kpt, 3)
+        """
+        B, M = q.shape[:2]
+
+        # Extract global features: (B, 1024, 3)
+        global_feature = self.increase_dim(q.permute(0, 2, 3, 1).contiguous())
+        global_feature = self.pool(global_feature)
+
+        # Combine global features, local features and coarse points
+        rebuild_feature = torch.cat([
+            global_feature.unsqueeze(1).expand(-1, M, -1, -1),
+            q,
+            kpt_3d.unsqueeze(2),
+        ], dim=2)  # (B, M, 1024 + C + 1, 3)
+
+        # Reduce to C point-type channels; decode_head converts them to vector offsets.
+        rebuild_feature = self.reduce_map(
+            rebuild_feature.permute(0, 2, 3, 1).contiguous()
+        ).permute(0, 3, 1, 2).contiguous()
+
+        # Predict relative coordinates: (B, M, pts_per_kpt, 3)
+        relative_xyz = self.decode_head(rebuild_feature)
+
+        # Reconstruct point cloud
+        rebuild_points = relative_xyz + kpt_3d.unsqueeze(2)
+
+        recon_model = rebuild_points.reshape(B, -1, 3).transpose(1, 2).contiguous()
+        recon_delta = relative_xyz.reshape(B, -1, 3).contiguous()
+
+        return recon_model, recon_delta
 
 @MODELS.register_module()
 class SIMECO(nn.Module):
@@ -1295,6 +1436,10 @@ class SIMECO(nn.Module):
 
     def build_loss_func(self):
         """Initialize the loss function for training."""
+        # Chamfer is only required by the full SIMECO completion wrapper.  Keep
+        # the binary extension out of the PCTransformer import path because it
+        # is tied to the PyTorch ABI used when it was compiled.
+        from extensions.chamfer_dist import ChamferDistanceL1
         self.loss_func = ChamferDistanceL1()
 
     def get_loss(self, ret, gt):
@@ -1339,7 +1484,7 @@ class SIMECO(nn.Module):
             Inference: (coarse_point_cloud, rebuild_points)
         """
         # Get features from base transformer model
-        q, coarse_point_cloud, denoise_length = self.base_model(xyz)  # B M C 3 and B M 3
+        q, coarse_point_cloud, _, _, denoise_length = self.base_model(xyz)  # B M C 3 and B M 3
         B, M, C, _ = q.shape
         
         # Extract global features

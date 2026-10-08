@@ -24,7 +24,7 @@ def get_parser():
     # pretrain
     parser.add_argument("--gpus",
                         type=str,
-                        default="0",
+                        default="1",
                         help="gpu num")
     parser.add_argument("--config",
                         type=str,

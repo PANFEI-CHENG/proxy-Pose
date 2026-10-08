@@ -70,6 +70,8 @@ class Reconstructor(nn.Module):
         
         recon_model = (recon_delta + kpt_3d_interleave).transpose(1, 2).contiguous()
         return recon_model, recon_delta
+
+
 class GeometricAwareFeatureAggregator(nn.Module):
     def __init__(self, cfg):
         super().__init__()

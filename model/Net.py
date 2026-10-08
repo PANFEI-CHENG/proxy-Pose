@@ -4,8 +4,9 @@ import torch.nn.functional as F
 from model.losses import ChamferDis, PoseDis, SmoothL1Dis, ChamferDis_wo_Batch
 from utils.data_utils import generate_augmentation
 from model.modules import ModifiedResnet, PointNet2MSG
-from model.Net_modules import InstanceAdaptiveKeypointDetector, GeometricAwareFeatureAggregator, PoseSizeEstimator, NOCS_Predictor, Reconstructor
-from simeco.simeco_pipeline import PCTransformer
+from model.Net_modules import PoseSizeEstimator, NOCS_Predictor
+from model.sim3_gafa import Sim3GeometricAwareFeatureAggregator
+from simeco.simeco_pipeline import PCTransformer, sim3Reconstructor
 
 class Net(nn.Module):
     def __init__(self, cfg, simeco_cfg):
@@ -26,17 +27,22 @@ class Net(nn.Module):
         else:
             raise NotImplementedError
         
-        self.pts_extractor = PointNet2MSG(radii_list=[[0.01, 0.02], [0.02,0.04], [0.04,0.08], [0.08,0.16]])
+        # self.pts_extractor = PointNet2MSG(radii_list=[[0.01, 0.02], [0.02,0.04], [0.04,0.08], [0.08,0.16]])
 
         self.base_model = PCTransformer(simeco_cfg)
         
-        self.IAKD = InstanceAdaptiveKeypointDetector(cfg.IAKD)
-        self.GAFA = GeometricAwareFeatureAggregator(cfg.GAFA)
+        # self.IAKD = InstanceAdaptiveKeypointDetector(cfg.IAKD)
+        self.GAFA = Sim3GeometricAwareFeatureAggregator(
+            cfg.GAFA,
+            query_dim=simeco_cfg.decoder_config.embed_dim,
+            context_dim=simeco_cfg.decoder_config.embed_dim,
+            bias_epsilon=simeco_cfg.bias_epsilon,
+        )
 
         self.nocs_predictor = NOCS_Predictor(cfg.NOCS_Predictor)
         self.estimator = PoseSizeEstimator()
 
-        self.reconstructor = Reconstructor(cfg.Reconstructor)
+        self.reconstructor = sim3Reconstructor(cfg.Reconstructor)
 
         
         
@@ -48,8 +54,7 @@ class Net(nn.Module):
         choose = inputs['choose']
         cls = inputs['category_label'].reshape(-1)
 
-        c = torch.mean(pts, 1, keepdim=True)  
-        pts = pts - c
+        c = torch.zeros_like(pts[:, :1])
         
         b = pts.size(0)
         index = cls + torch.arange(b, dtype=torch.long).cuda() * self.cat_num
@@ -78,21 +83,19 @@ class Net(nn.Module):
             delta_r, delta_t, delta_s = generate_augmentation(b)
             pts = (pts - delta_t) / delta_s.unsqueeze(2) @ delta_r
 
-        pts_local = self.pts_extractor(pts) # b, c, n
+        # pts_local = self.pts_extractor(pts) # b, c, n
 
-        q, coarse_point_cloud, denoise_length = self.base_model(pts, rgb_local)  # B M C 3 and B M 3
+        q, coarse_point_cloud, mem, coor, denoise_length = self.base_model(pts, rgb_local)  # B M C 3 and B M 3
 
-        batch_kpt_query, heat_map = self.IAKD(rgb_local, pts_local)
-        kpt_3d = torch.bmm(heat_map, pts)
-        kpt_feature = torch.bmm(heat_map, torch.cat((pts_local, rgb_local), dim=1).transpose(1, 2))
-        kpt_feature = self.GAFA(kpt_feature, kpt_3d.detach(), torch.cat((pts_local, rgb_local), dim=1).transpose(1, 2), pts)
-        recon_model, recon_delta = self.reconstructor(kpt_3d.transpose(1, 2), kpt_feature.transpose(1, 2))
-        kpt_nocs = self.nocs_predictor(kpt_feature, index)
-        r, t, s = self.estimator(kpt_3d, kpt_nocs.detach(), kpt_feature)
+        clean_length = q.size(1) - denoise_length if denoise_length else q.size(1)
+        q, kpt_3d = q[:, :clean_length], coarse_point_cloud[:, :clean_length]
+        q, q_inv = self.GAFA(q, kpt_3d, mem, coor)
+        recon_model, recon_delta = self.reconstructor(q, kpt_3d)
+        kpt_nocs = self.nocs_predictor(q_inv, index)
+        r, t, s = self.estimator(kpt_3d, kpt_nocs.detach(), q_inv)
 
         if self.training:
             end_points['recon_delta'] = recon_delta
-            end_points['pred_heat_map'] = heat_map
             end_points['pred_kpt_3d'] =  \
             (kpt_3d @ delta_r.transpose(1, 2)) * delta_s.unsqueeze(2) + delta_t + c
             end_points['recon_model'] =  \
