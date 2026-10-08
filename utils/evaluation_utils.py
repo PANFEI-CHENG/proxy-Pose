@@ -942,6 +942,11 @@ def evaluate(path, logger=None, cat_id=-1):
                             degree_thresholds=[5, 10],
                             shift_thresholds=[2, 5],
                             iou_3d_thresholds=[0.10, 0.25, 0.50, 0.75], logger=logger, cat_id=cat_id)
+    print("Compute CATRE IoU mAP: ")
+    from CATRE_evaluation_utils import compute_CATRE_IoU
+    compute_CATRE_IoU(final_results, synset_names,
+                            iou_3d_thresholds=[0.10, 0.25, 0.50, 0.75],
+                            logger=logger)
 
 
 def evaluate_housecat(path, logger=None):

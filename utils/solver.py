@@ -1,6 +1,8 @@
 import logging
 import os
 import pickle as cPickle
+import subprocess
+import sys
 import time
 
 import gorilla
@@ -28,12 +30,18 @@ class Solver(gorilla.solver.BaseSolver):
         self.per_write = cfg.per_write
         self.epoch = start_epoch
         self.iter = start_iter
+        self.eval_interval = int(getattr(cfg, 'eval_interval', 0))
+        self.eval_gpu = str(getattr(cfg, 'eval_gpu', '0'))
+        self.eval_workers = int(getattr(cfg, 'eval_workers', 4))
+        self.eval_process = None
+        self.eval_queue = []
         
         if start_epoch != 1:
             self.lr_scheduler.last_epoch = start_iter
         
     def solve(self):
         while self.epoch <= self.cfg.max_epoch:
+            self._poll_async_eval()
             self.logger.info('\nEpoch {} :'.format(self.epoch))
 
             end = time.time()
@@ -48,12 +56,44 @@ class Solver(gorilla.solver.BaseSolver):
             ckpt_path = os.path.join(
                 self.cfg.ckpt_dir, 'epoch_' + str(self.epoch) + '.pt')
             torch.save(self.model.state_dict(), ckpt_path)
+            if self.eval_interval > 0 and self.epoch % self.eval_interval == 0:
+                self.eval_queue.append((self.epoch, os.path.abspath(ckpt_path)))
+                self._poll_async_eval()
             
             prefix = 'Epoch {} - '.format(self.epoch)
             write_info = self.get_logger_info(prefix, dict_info=dict_info)
             write_info += f"lr: {self.lr_scheduler.get_lr()[0]:.5f}"
             self.logger.warning(write_info)
             self.epoch += 1
+        self._finish_async_eval()
+
+    def _poll_async_eval(self):
+        if self.eval_process is not None:
+            code = self.eval_process.poll()
+            if code is None:
+                return
+            self.logger.warning(f"Async evaluation finished with exit code {code}")
+            self.eval_process = None
+        if not self.eval_queue:
+            return
+        epoch, checkpoint = self.eval_queue.pop(0)
+        script = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'async_eval.py')
+        cmd = [sys.executable, script, '--config', self.cfg.config_path,
+               '--checkpoint', checkpoint, '--epoch', str(epoch),
+               '--gpu', self.eval_gpu, '--workers', str(self.eval_workers)]
+        env = os.environ.copy()
+        env['CUDA_VISIBLE_DEVICES'] = self.eval_gpu
+        output = open(os.path.join(self.cfg.log_dir, 'async_eval_process.log'), 'a')
+        self.eval_process = subprocess.Popen(cmd, cwd=os.path.dirname(script), env=env,
+                                             stdout=output, stderr=subprocess.STDOUT)
+        output.close()
+        self.logger.warning(f"Epoch {epoch}: asynchronous evaluation started on GPU {self.eval_gpu}")
+
+    def _finish_async_eval(self):
+        while self.eval_process is not None or self.eval_queue:
+            if self.eval_process is not None:
+                self.eval_process.wait()
+            self._poll_async_eval()
 
     def train(self):
         mode = 'train'
@@ -218,6 +258,7 @@ class Solver(gorilla.solver.BaseSolver):
         else:
             assert False
     
+@torch.no_grad()
 def test_func(model, dataloder, save_path):
     model.eval()
     time_all = 0

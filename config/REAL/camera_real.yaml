@@ -66,12 +66,16 @@ lr_scheduler:
 max_epoch : 30
 
 loss:
-  cd: 2.0
-  nocs: 2.0
-  recon: 15.0
-  delta: 1.0
-  diversity: 10.0
   pose: 0.3
+  pose_init: 0.1
+  recon: 15.0
+  obj_cd: 2.0
+  proxy_surface: 5.0
+  proxy_coverage: 2.0
+  nocs: 2.0
+  geo: 1.0
+  diversity: 1.0
+  delta: 1.0
   th: 0.01
   obj_aware: True
 
