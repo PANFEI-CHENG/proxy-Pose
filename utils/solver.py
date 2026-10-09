@@ -116,7 +116,7 @@ class Solver(gorilla.solver.BaseSolver):
         for train_data in data_iter:
             data_time = time.time()-end
 
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
             method = getattr(self, f"step_{self.dataset_name}")
             loss, dict_info_step = method(train_data, mode)
             forward_time = time.time()-end-data_time

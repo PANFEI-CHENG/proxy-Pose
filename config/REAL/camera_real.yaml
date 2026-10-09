@@ -7,8 +7,8 @@ train_dataset:
   image_size: 224       # [192, 224]
   sample_num: 1024
   outlier_th: 0.1
-  syn_bs: 18
-  real_bs: 6
+  syn_bs: 12
+  real_bs: 4
   syn_num_workers: 12
   real_num_workers: 4
   shuffle: True
@@ -63,7 +63,7 @@ lr_scheduler:
   step_size_down: 20000
   cycle_momentum: False
 
-max_epoch : 30
+max_epoch : 50
 
 loss:
   pose: 0.3

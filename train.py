@@ -4,19 +4,11 @@ import argparse
 import logging
 import random
 
-import torch
-import gorilla
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(BASE_DIR, 'provider'))
 sys.path.append(os.path.join(BASE_DIR, 'model'))
 sys.path.append(os.path.join(BASE_DIR, 'model', 'pointnet2'))
 sys.path.append(os.path.join(BASE_DIR, 'utils'))
-
-from create_dataloaders import create_dataloaders
-from solver import Solver, get_logger
-from Net import Net
-from model.losses import ComPoseProxyLoss as Loss
 
 def get_parser():
     parser = argparse.ArgumentParser(
@@ -29,6 +21,7 @@ def get_parser():
                         help="gpu num")
     parser.add_argument("--config",
                         type=str,
+                        default=os.path.join(BASE_DIR, "config/REAL/camera_real.yaml"),
                         help="path to config file")
     parser.add_argument("--eval_gpu", type=str, default="3",
                         help="physical GPU used by asynchronous evaluation")
@@ -44,6 +37,12 @@ def init():
     args = get_parser()
     if args.eval_interval > 0 and args.eval_gpu in {gpu.strip() for gpu in args.gpus.split(',')}:
         raise ValueError('--eval_gpu must be different from the training GPU(s)')
+    # Select the physical training GPU before importing torch/CUDA extensions.
+    os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpus
+    os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'max_split_size_mb:128')
+    import gorilla
+    from solver import get_logger
     exp_name = args.config.split("/")[-1].split(".")[0]
     log_dir = os.path.join("log", exp_name)
     
@@ -67,12 +66,16 @@ def init():
     cfg.eval_workers = args.eval_workers
     logger = get_logger(
         level_print=logging.INFO, level_save=logging.WARNING, path_file=log_dir+"/training_logger.log")
-    gorilla.utils.set_cuda_visible_devices(gpu_ids=cfg.gpus)
-
     return logger, cfg
 
 if __name__ == "__main__":
     logger, cfg = init()
+    import torch
+    import gorilla
+    from create_dataloaders import create_dataloaders
+    from solver import Solver
+    from Net import Net
+    from model.losses import ComPoseProxyLoss as Loss
 
     logger.warning(
         "************************ Start Logging ************************")
@@ -92,6 +95,8 @@ if __name__ == "__main__":
     start_iter = 0
     
     model = model.cuda()
+    # Create the lazy cuBLAS handle before activations occupy most GPU memory.
+    torch.mm(torch.ones(1, 1, device='cuda'), torch.ones(1, 1, device='cuda'))
         
     count_parameters = sum(gorilla.parameter_count(model).values())
     logger.warning("#Total parameters : {}".format(count_parameters))
